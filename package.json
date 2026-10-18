@@ -1,12 +1,8 @@
 {
   "name": "red10-network-probe",
-  "version": "1.0.0",
+  "version": "1.1.0-preview-proxy",
   "private": true,
   "type": "module",
   "engines": { "node": ">=24 <25" },
-  "scripts": {
-    "build": "node --check server.mjs",
-    "start": "node server.mjs",
-    "check:local": "node check-local.mjs"
-  }
+  "scripts": { "build": "node --check server.mjs", "start": "node server.mjs", "check:local": "node check-local.mjs" }
 }

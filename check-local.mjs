@@ -1,62 +1,27 @@
+// Finite local checks only; no game, cloud requests, secrets or keepalive job.
 import assert from 'node:assert/strict';
-import { once } from 'node:events';
-import { createProbeServer, PROBE_ID } from './server.mjs';
-
-// Finite loopback check only. This script never contacts Render or Cloudflare.
-const server = createProbeServer();
-server.listen(0, '127.0.0.1');
-await once(server, 'listening');
-const base = `http://127.0.0.1:${server.address().port}`;
-let checks = 0;
-const check = async (name, fn) => { await fn(); checks++; console.log(`PASS ${name}`); };
+import { createProxy, permitted, upstreamHeaders, downstreamHeaders, UPSTREAM, BUILD } from './server.mjs';
+const proxy = createProxy({ localOnly: true, connect: () => { throw new Error('Local check must never contact cloud'); } });
+const origin = await proxy.listen();
+let count = 0;
+async function check(name, fn) { await fn(); count++; console.log(`PASS ${name}`); }
+const req = (headers = {}) => ({ method: 'POST', url: '/api/rooms', headers: { host: new URL(origin).host, origin, ...headers } });
 try {
-  await check('homepage: 200, inline resources, no script or remote URL', async () => {
-    const response = await fetch(base + '/');
-    assert.equal(response.status, 200);
-    const html = await response.text();
-    assert.ok(html.includes('测试首页已打开'));
-    assert.ok(html.includes('href="/health"'));
-    assert.doesNotMatch(html, /<script|https?:\/\//i);
+  await check('Local health identifies candidate without upstream traffic', async () => {
+    const response = await fetch(origin + '/health'); assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: true, mode: 'preview-proxy', build: BUILD, upstreamChecked: false });
   });
-  await check('health: live JSON, no game connection, no redirect', async () => {
-    const response = await fetch(base + '/health', { redirect: 'manual' });
-    assert.equal(response.status, 200);
-    assert.equal(response.headers.get('location'), null);
-    assert.equal(response.headers.get('cache-control'), 'no-store');
-    const json = await response.json();
-    assert.equal(json.ok, true);
-    assert.equal(json.probe, PROBE_ID);
-    assert.equal(json.gameConnected, false);
-    assert.ok(Math.abs(Date.now() - Date.parse(json.time)) < 10000);
+  await check('Health HEAD supported', async () => { const response = await fetch(origin + '/health', { method: 'HEAD' }); assert.equal(response.status, 200); assert.equal(await response.text(), ''); });
+  await check('Foreign Origin rejected before cloud connection', async () => { assert.equal((await fetch(origin + '/api/health', { headers: { Origin: 'https://foreign.invalid' } })).status, 403); });
+  await check('Only actual same-origin mutation accepted', () => { assert.ok(permitted(req(), origin)); assert.ok(!permitted(req({ origin: undefined }), origin)); assert.ok(!permitted(req({ origin: 'null' }), origin)); });
+  await check('Forwarded authority and cookie credentials stripped', () => {
+    const headers = upstreamHeaders(req({ 'x-forwarded-host': 'foreign.invalid', cookie: 'test', authorization: 'test' }));
+    assert.equal(headers.origin, UPSTREAM); assert.equal(headers.host, new URL(UPSTREAM).host);
+    for (const field of ['x-forwarded-host', 'cookie', 'authorization']) assert.equal(headers[field], undefined);
   });
-  await check('HEAD supports platform health checks', async () => {
-    const response = await fetch(base + '/health', { method: 'HEAD' });
-    assert.equal(response.status, 200);
-    assert.equal(await response.text(), '');
+  await check('External redirects refused; same upstream redirected to entry', () => {
+    assert.throws(() => downstreamHeaders({ location: 'https://foreign.invalid/' }, origin));
+    assert.equal(downstreamHeaders({ location: UPSTREAM + '/diagnostics.html' }, origin).location, origin + '/diagnostics.html');
   });
-  await check('POST is not accepted', async () => {
-    const response = await fetch(base + '/health', { method: 'POST' });
-    assert.equal(response.status, 405);
-  });
-  await check('game API, diagnostics and arbitrary proxy paths are absent', async () => {
-    for (const path of ['/api/health', '/api/rooms', '/diagnostics', '/proxy', '/health?target=other']) {
-      assert.equal((await fetch(base + path)).status, 404);
-    }
-  });
-  await check('no WebSocket upgrade endpoint', async () => {
-    const { request } = await import('node:http');
-    const status = await new Promise((resolve, reject) => {
-      const req = request(base + '/ws', { headers: { Connection: 'Upgrade', Upgrade: 'websocket' } }, res => {
-        res.resume(); resolve(res.statusCode);
-      });
-      req.on('upgrade', (_res, socket) => { socket.destroy(); reject(new Error('Unexpected WebSocket upgrade')); });
-      req.on('error', reject);
-      req.setTimeout(3000, () => req.destroy(new Error('Timeout')));
-      req.end();
-    });
-    assert.equal(status, 404);
-  });
-  console.log(`LOCAL_CHECKS=${checks}/6`);
-} finally {
-  await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-}
+  console.log(`LOCAL_CHECKS=${count}/6`);
+} finally { await proxy.stop(); }
